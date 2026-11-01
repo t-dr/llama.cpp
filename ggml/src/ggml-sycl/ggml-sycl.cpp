@@ -69,6 +69,7 @@
 #include "ggml-sycl/fused-gemm.hpp"
 #include "ggml-sycl/gemm.hpp"
 #include "ggml-sycl/getrows.hpp"
+#include "ggml-sycl/ggml-sycl-topology.h"
 #include "ggml-sycl/mem.hpp"
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/presets.hpp"
@@ -192,6 +193,17 @@ static bool ggml_sycl_dnnl_detect_optimized_gemm(int device) {
 
 static ggml_sycl_device_info ggml_sycl_init() {
     GGML_SYCL_DEBUG("[SYCL] call ggml_sycl_init\n");
+
+    // Insert your topology discovery logic right here:
+    auto topo = ggml::sycl::Topology::discover();
+    if (!topo.devices.empty()) {
+        const auto & selected_dev = topo.devices[0];
+        fprintf(stderr, "ggml-sycl: Initializing backend with device %d: %s [%s]\n",
+                selected_dev.device_id,
+                selected_dev.name.c_str(),
+                selected_dev.is_gpu ? "GPU" : "CPU");
+    }
+
     ggml_sycl_device_info info = {};
 
     // Do not hard crash when there exists no SYCL devices.
