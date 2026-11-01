@@ -5,6 +5,7 @@
 #include <string>
 #include <algorithm>
 #include <sycl/sycl.hpp>
+#include <iostream>
 
 namespace ggml::sycl {
 
@@ -61,19 +62,22 @@ struct Topology {
                     
                     try {
                         dev.max_compute_units = device.get_info<::sycl::info::device::max_compute_units>();
-                    } catch (...) {
+                    } catch (const sycl::exception &e) {
+                        std::cerr << "Error retrieving max_compute_units: " << e.what() << std::endl;
                         dev.max_compute_units = 0;
                     }
 
                     try {
                         dev.max_work_group_size = device.get_info<::sycl::info::device::max_work_group_size>();
-                    } catch (...) {
+                    } catch (const sycl::exception &e) {
+                        std::cerr << "Error retrieving max_work_group_size: " << e.what() << std::endl;
                         dev.max_work_group_size = 0;
                     }
 
                     try {
                         dev.global_mem_size = device.get_info<::sycl::info::device::global_mem_size>();
-                    } catch (...) {
+                    } catch (const sycl::exception &e) {
+                        std::cerr << "Error retrieving global_mem_size: " << e.what() << std::endl;
                         dev.global_mem_size = 0;
                     }
 
@@ -91,8 +95,8 @@ struct Topology {
                 topo.devices[i].device_id = static_cast<int>(i);
             }
 
-        } catch (...) {
-            // Fallback or empty topology on exception
+        } catch (const sycl::exception &e) {
+            std::cerr << "General SYCL error during topology discovery: " << e.what() << std::endl;
         }
         return topo;
     }

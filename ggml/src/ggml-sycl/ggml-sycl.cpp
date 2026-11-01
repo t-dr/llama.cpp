@@ -194,14 +194,14 @@ static bool ggml_sycl_dnnl_detect_optimized_gemm(int device) {
 static ggml_sycl_device_info ggml_sycl_init() {
     GGML_SYCL_DEBUG("[SYCL] call ggml_sycl_init\n");
 
-    // Insert your topology discovery logic right here:
+    // Insert topology discovery logic
     auto topo = ggml::sycl::Topology::discover();
     if (!topo.devices.empty()) {
         const auto & selected_dev = topo.devices[0];
-        fprintf(stderr, "ggml-sycl: Initializing backend with device %d: %s [%s]\n",
-                selected_dev.device_id,
-                selected_dev.name.c_str(),
-                selected_dev.is_gpu ? "GPU" : "CPU");
+        std::cerr << "ggml-sycl: Initializing backend with device "
+                  << selected_dev.device_id << ": "
+                  << selected_dev.name << " ["
+                  << (selected_dev.is_gpu ? "GPU" : "CPU") << "]\n";
     }
 
     ggml_sycl_device_info info = {};
@@ -222,6 +222,7 @@ static ggml_sycl_device_info ggml_sycl_init() {
     GGML_ASSERT(info.device_count <= GGML_SYCL_MAX_DEVICES);
 
     int64_t total_vram = 0;
+
 /* This is a bit misleading;  reserved for later */
 // #if defined(GGML_SYCL_SUPPORT_XMX) && !defined(GGML_SYCL_FORCE_MMQ)
 //     GGML_LOG_INFO("%s: GGML_SYCL_SUPPORT_XMX: yes\n", __func__);
