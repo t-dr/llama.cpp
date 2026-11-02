@@ -1015,6 +1015,70 @@ template <bool SR> struct xmx_traits_q8_0 : xmx_traits_base<SR, 16, xmx_scale_ki
     static ESIMD_INLINE simd<uint32_t, 128> unpack(const part_t & p, int g, int /*part*/) { return p.q[g]; }
 };
 
+// Q4_0 reorder layout: [qs: nrows*K/2 bytes] [d: one half per 32 weights]
+// a qs byte packs two weights: low nibble is the first half of the block, high nibble the second
+// the -8 offset enters through the min term: w = d*q - 8*d
+template <bool SR> struct xmx_traits_q4_0 : xmx_traits_base<SR, 16, xmx_scale_kind::min> {
+    struct ctx : xmx_ctx_base {
+        const uint8_t *    qs;
+        const sycl::half * dh;
+        unsigned           pq;
+    };
+
+    static ESIMD_INLINE ctx make(const void * vx, int nrows, int bpr, int row0) {
+        ctx c;
+        xmx_ctx_init(c, nrows, bpr, row0);
+        c.qs = (const uint8_t *) vx;
+        c.dh = (const sycl::half *) (c.qs + (size_t) nrows * bpr * (QK_K / 2));
+        c.pq = xmx_pitch(bpr, QK_K / 2);
+        return c;
+    }
+
+    struct scales_t {
+        xmx_row_scales<8> d;  // scale of each of the 8 blocks of a super-block
+        xmx_row_scales<8> m;  // 8 * d, the -8 offset as min term
+    };
+
+    static ESIMD_INLINE scales_t load_scales(const ctx & c, int sb, const simd<uint32_t, 16> & rows) {
+        using namespace sycl::ext::intel::esimd;
+        scales_t           s;
+        simd<uint32_t, 16> blk = (rows * c.bpr + sb) * (QK_K / QK4_0);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const simd<float, 16> d = convert<float>(gather<sycl::half, 16>(c.dh, (blk + j) * (uint32_t) sizeof(sycl::half)));
+            s.d.v[j] = d;
+            s.m.v[j] = d * 8.0f;
+        }
+        return s;
+    }
+
+    struct part_t {
+        simd<uint32_t, 64> q[4];  // one group of 32 packed weights per load: 16 bytes per row
+    };
+
+    static ESIMD_INLINE part_t load_part(const ctx & c, int sb, int part) {
+        part_t p;
+#pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            p.q[g] = xmx_load_t<4, SR>(c.qs, c.pq, c.h, sb * 32 + 4 * (4 * part + g), c.row0);
+        }
+        return p;
+    }
+
+    static ESIMD_INLINE simd<uint32_t, 128> unpack(const part_t & p, int g, int /*part*/) {
+        // k-major layout: packed u32 k lands at [k*16 .. k*16+16) and expands to two u32 of weight
+        // bytes: low nibbles fill u32 k (weights 4k..4k+3), high nibbles u32 k+4 (weights 16+4k..)
+        simd<uint32_t, 64>  q = p.q[g];
+        simd<uint32_t, 128> x;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            x.template select<16, 1>(k * 16)       =  q.template select<16, 1>(k * 16) & 0x0F0F0F0Fu;
+            x.template select<16, 1>((k + 4) * 16) = (q.template select<16, 1>(k * 16) >> 4) & 0x0F0F0F0Fu;
+        }
+        return x;
+    }
+};
+
 template <bool SR> using xmx_traits_q4_k = xmx_traits_q45_k<false, SR>;
 template <bool SR> using xmx_traits_q5_k = xmx_traits_q45_k<true, SR>;
 

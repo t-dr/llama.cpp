@@ -1428,6 +1428,8 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
             GGML_LOG_DEBUG("node #%3d (%10.10s): %20.20s (%5.5s) [%5.5s %8.8s] use=%d,c=%d:", i, ggml_op_desc(node), node->name,
                 fmt_size(ggml_nbytes(node)), tensor_backend ? ggml_backend_name(tensor_backend) : "NULL", GET_CAUSE(node),
                 graph->use_counts[ggml_hash_find(&graph->visited_hash_set, node)], node->flags & GGML_TENSOR_FLAG_COMPUTE ? 1 : 0);
+            fprintf(stderr, "[SCHED] node #%3d %10.10s %20.20s -> %s\n", i, ggml_op_desc(node), node->name,
+                tensor_backend ? ggml_backend_name(tensor_backend) : "NULL");
             for (int j = 0; j < GGML_MAX_SRC; j++) {
                 struct ggml_tensor * src = node->src[j];
                 if (src == NULL) {

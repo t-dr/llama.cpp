@@ -242,6 +242,7 @@ typedef sycl::float2 dfloat2;
 
 static inline bool ggml_sycl_xmx_supports_type(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:
