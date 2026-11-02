@@ -5278,6 +5278,25 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         use_dequantize_mul_mat_vec = use_dequantize_mul_mat_vec && use;
     }
 
+    if (src0->type == GGML_TYPE_Q4_0) {
+        static int matmul_dbg = 0;
+        static const bool diag = ggml_sycl_get_env("GGML_SYCL_KERNEL_DIAG", 0) != 0;
+        if (diag && matmul_dbg++ < 24) {
+            const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+            const char * route = use_dequantize_mul_mat_vec ? "DMMV" :
+                                 use_mul_mat_vec_q         ? "MMVQ" :
+                                 use_mul_mat_q             ? "MMQ" : "SYCL";
+            fprintf(stderr,
+                    "[MATMULPICK] route=%s xmx_batch=%d split=%d reordered=%d W=[%lld,%lld,%lld,%lld] "
+                    "X=[%lld,%lld,%lld,%lld]\n",
+                    route, (int) can_use_xmx_batch(ctx.device, src0, src1), (int) split,
+                    extra && extra->optimized_feature.reorder,
+                    (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2],
+                    (long long) src0->ne[3], (long long) src1->ne[0], (long long) src1->ne[1],
+                    (long long) src1->ne[2], (long long) src1->ne[3]);
+        }
+    }
+
     if (!split && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1) {
         // TODO: Refactor and cleanup of mul mat dispatching.
         if (src0->ne[3] == 1 && src1->ne[3] == 1) {

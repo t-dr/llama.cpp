@@ -299,13 +299,16 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel_impl(const int device, 
 
 static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
     const best_fattn_kernel k = ggml_sycl_get_best_fattn_kernel_impl(device, dst);
-    const ggml_tensor * Q = dst->src[0];
-    const ggml_tensor * K = dst->src[1];
-    const ggml_tensor * V = dst->src[2];
-    fprintf(stderr, "[FAPICK] dev=%d kernel=%s nq=%lld nkv=%lld dk=%lld dv=%lld K=%s V=%s\n",
-            device, fattn_kernel_name(k),
-            (long long) Q->ne[1], (long long) K->ne[1], (long long) K->ne[0], (long long) V->ne[0],
-            ggml_type_name(K->type), ggml_type_name(V->type));
+    static const bool log_pick = ggml_sycl_get_env("GGML_SYCL_KERNEL_DIAG", 0) != 0;
+    if (log_pick) {
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        const ggml_tensor * V = dst->src[2];
+        fprintf(stderr, "[FAPICK] dev=%d kernel=%s nq=%lld nkv=%lld dk=%lld dv=%lld K=%s V=%s\n",
+                device, fattn_kernel_name(k),
+                (long long) Q->ne[1], (long long) K->ne[1], (long long) K->ne[0], (long long) V->ne[0],
+                ggml_type_name(K->type), ggml_type_name(V->type));
+    }
     return k;
 }
 

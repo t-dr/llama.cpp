@@ -2134,43 +2134,65 @@ static bool ggml_sycl_mul_mat_vec_q_xmx(int                 device,
                                         int64_t             src1_padded_col_size,
                                         dpct::queue_ptr     stream) {
     const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
-    {
-        static int mm_dbg = 0;
-        if (mm_dbg++ < 30) {
-            fprintf(stderr,
-                    "[MMPICK] dev=%d type=%s ncols=%lld xmx_enabled=%d type_ok=%d extra=%d reorder=%d\n",
-                    device, ggml_type_name(src0->type), (long long) src1_ncols,
-                    (int) ggml_sycl_xmx_enabled(device), (int) ggml_sycl_xmx_supports_type(src0->type),
-                    extra != nullptr, extra ? (int) extra->optimized_feature.reorder : -1);
-        }
+    static int mm_dbg_narrow = 0;
+    static int mm_dbg_wide   = 0;
+    int &       mm_dbg       = src1_ncols <= 8 ? mm_dbg_narrow : mm_dbg_wide;
+    static const bool diag   = ggml_sycl_get_env("GGML_SYCL_KERNEL_DIAG", 0) != 0;
+    const bool  log_pick     = diag && mm_dbg++ < 30;
+    if (log_pick) {
+        fprintf(stderr,
+                "[MMPICK] dev=%d type=%s ncols=%lld xmx_enabled=%d type_ok=%d extra=%d reorder=%d\n",
+                device, ggml_type_name(src0->type), (long long) src1_ncols,
+                (int) ggml_sycl_xmx_enabled(device), (int) ggml_sycl_xmx_supports_type(src0->type),
+                extra != nullptr, extra ? (int) extra->optimized_feature.reorder : -1);
     }
     if (!ggml_sycl_xmx_enabled(device) || !ggml_sycl_xmx_supports_type(src0->type) || !extra ||
         !extra->optimized_feature.reorder) {
+        if (log_pick) {
+            fprintf(stderr, "[MMPICK] status=reject-capability-or-reorder\n");
+        }
         return false;
     }
     if (src1_ncols < ggml_sycl_xmx_min_cols(src0->type) || src1_ncols > g_ggml_sycl_xmx_max_cols) {
+        if (log_pick) {
+            fprintf(stderr, "[MMPICK] status=reject-column-range\n");
+        }
         return false;
     }
 
     const int ne00 = src0->ne[0];
     const int ldd  = dst->ne[0];
     if (!ggml_sycl_esimd::xmx_supported(src0_dd_i, ne00)) {
+        if (log_pick) {
+            fprintf(stderr, "[MMPICK] status=reject-weight-alignment-or-K\n");
+        }
         return false;
     }
 
     // rows under 64 bytes use the variant without 2D block loads, it is not built for the widest tile
     const bool short_rows = ne00 < 4 * QK_K;
     if (short_rows && src1_ncols > 8) {
+        if (log_pick) {
+            fprintf(stderr, "[MMPICK] status=reject-short-rows\n");
+        }
         return false;
     }
 
     const int stride_y_bytes = src1_padded_col_size * sizeof(block_q8_1) / QK8_1;
     // the 2D block loads of the activations need a 64 byte aligned base and a pitch of 16 bytes
     if ((uintptr_t) src1_ddq_i % 64 != 0 || stride_y_bytes % 16 != 0) {
+        if (log_pick) {
+            fprintf(stderr, "[MMPICK] status=reject-activation-alignment-or-pitch\n");
+        }
         return false;
     }
-    return ggml_sycl_mul_mat_vec_q_xmx_type(src0->type, short_rows, src0_dd_i, nullptr, src1_ddq_i, dst_dd_i, ne00,
-                                            row_diff, src1_ncols, stride_y_bytes, ldd, 0, stream);
+    const bool launched = ggml_sycl_mul_mat_vec_q_xmx_type(src0->type, short_rows, src0_dd_i, nullptr, src1_ddq_i,
+                                                           dst_dd_i, ne00, row_diff, src1_ncols, stride_y_bytes,
+                                                           ldd, 0, stream);
+    if (log_pick) {
+        fprintf(stderr, "[MMPICK] status=%s\n", launched ? "xmx-dispatched" : "unsupported-type");
+    }
+    return launched;
 }
 #endif // GGML_SYCL_MMVQ_HAS_XMX
 
