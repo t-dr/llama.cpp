@@ -69,7 +69,7 @@
 #include "ggml-sycl/fused-gemm.hpp"
 #include "ggml-sycl/gemm.hpp"
 #include "ggml-sycl/getrows.hpp"
-#include "ggml-sycl/ggml-sycl-topology.h"
+#include "ggml-sycl/ggml-sycl-topology.hpp"
 #include "ggml-sycl/mem.hpp"
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/presets.hpp"
@@ -193,17 +193,6 @@ static bool ggml_sycl_dnnl_detect_optimized_gemm(int device) {
 
 static ggml_sycl_device_info ggml_sycl_init() {
     GGML_SYCL_DEBUG("[SYCL] call ggml_sycl_init\n");
-
-    // Insert topology discovery logic
-    auto topo = ggml::sycl::Topology::discover();
-    if (!topo.devices.empty()) {
-        const auto & selected_dev = topo.devices[0];
-        std::cerr << "ggml-sycl: Initializing backend with device "
-                  << selected_dev.device_id << ": "
-                  << selected_dev.name << " ["
-                  << (selected_dev.is_gpu ? "GPU" : "CPU") << "]\n";
-    }
-
     ggml_sycl_device_info info = {};
 
     // Do not hard crash when there exists no SYCL devices.
@@ -221,8 +210,9 @@ static ggml_sycl_device_info ggml_sycl_init() {
 
     GGML_ASSERT(info.device_count <= GGML_SYCL_MAX_DEVICES);
 
-    int64_t total_vram = 0;
+    info.topology = ggml_sycl::discover_topology();
 
+    int64_t total_vram = 0;
 /* This is a bit misleading;  reserved for later */
 // #if defined(GGML_SYCL_SUPPORT_XMX) && !defined(GGML_SYCL_FORCE_MMQ)
 //     GGML_LOG_INFO("%s: GGML_SYCL_SUPPORT_XMX: yes\n", __func__);
@@ -235,6 +225,13 @@ static ggml_sycl_device_info ggml_sycl_init() {
 
         SYCL_CHECK(CHECK_TRY_ERROR(dpct::get_device_info(
             prop, device)));
+
+        const ggml_sycl::Device * tdev =
+            (size_t) i < info.topology.devices.size() ? &info.topology.devices[i] : nullptr;
+        if (tdev) {
+            GGML_LOG_INFO("%s: device %d topology:\n%s", GGML_SYCL_NAME, i,
+                          ggml_sycl::describe(*tdev).c_str());
+        }
 
 #if !defined(GGML_SYCL_SUPPORT_VMM)
         info.devices[i].vmm = 0;
@@ -259,7 +256,9 @@ static ggml_sycl_device_info ggml_sycl_init() {
 
         info.devices[i].cc =
             100 * prop.get_major_version() + 10 * prop.get_minor_version();
-        info.devices[i].nsm = prop.get_max_compute_units() / 16; //16: Number of Xe Cores
+        info.devices[i].nsm = tdev && tdev->gpu_eu_count_per_subslice > 0
+                                  ? (int) (tdev->gpu_eu_count / tdev->gpu_eu_count_per_subslice)
+                                  : prop.get_max_compute_units() / 16;
         info.devices[i].opt_feature.reorder = device.ext_oneapi_architecture_is(syclex::arch_category::intel_gpu);
 #if GGML_SYCL_DNNL
         info.devices[i].opt_feature.onednn_optimized_gemm = ggml_sycl_dnnl_detect_optimized_gemm(i);
@@ -296,6 +295,11 @@ static ggml_sycl_device_info ggml_sycl_init() {
             }
         }
 #endif
+    }
+
+    for (size_t i = info.device_count; i < info.topology.devices.size(); ++i) {
+        GGML_LOG_INFO("%s: SYCL device not usable by backend:\n%s", GGML_SYCL_NAME,
+                      ggml_sycl::describe(info.topology.devices[i]).c_str());
     }
 
     for (int id = 0; id < info.device_count; ++id) {

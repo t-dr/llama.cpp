@@ -26,6 +26,7 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-sycl.h"
+#include "ggml-sycl-topology.hpp"
 #include "presets.hpp"
 #include "type.hpp"
 #include "sycl_hw.hpp"
@@ -349,12 +350,37 @@ struct ggml_sycl_device_info {
     int max_work_group_sizes[GGML_SYCL_MAX_DEVICES] = {0};
 
     bool ext_oneapi_level_zero = true; // sycl::backend::ext_oneapi_level_zero used by all enumerated GPU devices
+
+    ggml_sycl::Topology topology;
 };
 
 ggml_sycl_device_info & ggml_sycl_info();
 
 static inline bool ggml_sycl_xmx_enabled(int device) {
-    return g_ggml_sycl_enable_xmx_esimd && ggml_sycl_xmx_supports_arch(ggml_sycl_info().devices[device].hw_info.arch);
+    if (!g_ggml_sycl_enable_xmx_esimd) {
+        return false;
+    }
+    const auto & info = ggml_sycl_info();
+    if (ggml_sycl_xmx_supports_arch(info.devices[device].hw_info.arch)) {
+        return true;
+    }
+    // unrecognized arch: enable when the device reports the capabilities the
+    // Xe2 XMX kernel needs; try it and see, per the capability probe
+    const auto & tdevs = info.topology.devices;
+    const auto * tdev  = (size_t) device < tdevs.size() ? &tdevs[device] : nullptr;
+    const bool caps_ok = tdev && tdev->is_gpu && tdev->has_subgroup_mma && tdev->has_2d_block_io &&
+                         std::find(tdev->sub_group_sizes.begin(), tdev->sub_group_sizes.end(), 16) !=
+                             tdev->sub_group_sizes.end();
+    if (caps_ok) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_INFO("%s: device %d reports XMX-capable hardware with unrecognized arch 0x%llx; "
+                          "enabling XMX kernels\n",
+                          GGML_SYCL_NAME, device, (unsigned long long) info.devices[device].hw_info.arch);
+        }
+    }
+    return caps_ok;
 }
 
 static constexpr size_t SYCL_BUFFER_ALIGNMENT = 128;

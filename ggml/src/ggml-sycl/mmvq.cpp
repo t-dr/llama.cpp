@@ -2132,6 +2132,16 @@ static bool ggml_sycl_mul_mat_vec_q_xmx(int                 device,
                                         int64_t             src1_padded_col_size,
                                         dpct::queue_ptr     stream) {
     const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+    {
+        static int mm_dbg = 0;
+        if (mm_dbg++ < 30) {
+            fprintf(stderr,
+                    "[MMPICK] dev=%d type=%s ncols=%lld xmx_enabled=%d type_ok=%d extra=%d reorder=%d\n",
+                    device, ggml_type_name(src0->type), (long long) src1_ncols,
+                    (int) ggml_sycl_xmx_enabled(device), (int) ggml_sycl_xmx_supports_type(src0->type),
+                    extra != nullptr, extra ? (int) extra->optimized_feature.reorder : -1);
+        }
+    }
     if (!ggml_sycl_xmx_enabled(device) || !ggml_sycl_xmx_supports_type(src0->type) || !extra ||
         !extra->optimized_feature.reorder) {
         return false;

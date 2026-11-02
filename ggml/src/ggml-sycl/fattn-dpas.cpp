@@ -606,8 +606,8 @@ static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst) 
     p.nb33 = mask ? mask->nb[3] : 0;
 
     // split the keys so that all work-groups run in one wave
-    // SLM fits about 4 work-groups per Xe2 core with 16 rows, 2 with 32. Xe2 core = 8 EUs, nsm = EUs / 16.
-    const int xe_cores = std::max(1, ggml_sycl_info().devices[ctx.device].nsm * 2);
+    // SLM fits about 4 work-groups per Xe2 core with 16 rows, 2 with 32
+    const int xe_cores = std::max(1, ggml_sycl_info().devices[ctx.device].nsm);
     const int wave     = xe_cores * (NR16 == 1 ? 4 : 2);
     const int ntiles   = (ne11 + TK - 1) / TK;
     int nsplit = std::max(1, std::min(wave / (nkvh * ne03 * p.nqc), ntiles));

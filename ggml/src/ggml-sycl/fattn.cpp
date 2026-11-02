@@ -105,7 +105,19 @@ enum best_fattn_kernel {
 };
 
 
-static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+static const char * fattn_kernel_name(best_fattn_kernel k) {
+    switch (k) {
+        case BEST_FATTN_KERNEL_NONE:   return "NONE";
+        case BEST_FATTN_KERNEL_VEC:    return "VEC";
+        case BEST_FATTN_KERNEL_DPAS:   return "DPAS";
+        case BEST_FATTN_KERNEL_ONEDNN: return "ONEDNN";
+        case BEST_FATTN_KERNEL_TILE:   return "TILE";
+        case BEST_FATTN_KERNEL_MKL:    return "MKL";
+        default:                       return "?";
+    }
+}
+
+static best_fattn_kernel ggml_sycl_get_best_fattn_kernel_impl(const int device, const ggml_tensor * dst) {
 #ifndef SYCL_FLASH_ATTN
     GGML_UNUSED(dst);
     return BEST_FATTN_KERNEL_NONE;
@@ -283,6 +295,18 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         }
     }
     return BEST_FATTN_KERNEL_TILE;
+}
+
+static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+    const best_fattn_kernel k = ggml_sycl_get_best_fattn_kernel_impl(device, dst);
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    fprintf(stderr, "[FAPICK] dev=%d kernel=%s nq=%lld nkv=%lld dk=%lld dv=%lld K=%s V=%s\n",
+            device, fattn_kernel_name(k),
+            (long long) Q->ne[1], (long long) K->ne[1], (long long) K->ne[0], (long long) V->ne[0],
+            ggml_type_name(K->type), ggml_type_name(V->type));
+    return k;
 }
 
 void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
