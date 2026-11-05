@@ -42,7 +42,45 @@ U32 packed weight: A 32-bit word used as a container for smaller quantized
 ### GGUF output formats
 
 Q4_0 and Q4_K: GGUF output quantization formats. They differ from the source
-  checkpoint's NVFP4 format and are not part of this F16 export.
+checkpoint's NVFP4 format and are not part of this F16 export.
+
+### Model evaluation
+
+BOS token: The beginning-of-sequence special token. The perplexity comparison
+  inserts it at the start of each context chunk.
+
+Cross-entropy: The average negative log-probability assigned to the correct
+  next tokens. Its exponential is perplexity.
+
+Forward pass: One run of input tokens through the model layers to produce
+  logits.
+
+KL divergence: A measure of how much one next-token probability distribution
+  differs from another. A value near zero means the distributions are close.
+
+Logits: Unnormalized scores for the vocabulary tokens. Softmax converts them
+  into probabilities.
+
+Log-probability: The logarithm of a token's probability. The KL comparison
+  file stores these values in a compact 16-bit format.
+
+Perplexity: The exponent of average negative log-probability over a token
+  sequence. Compare perplexity only with the same token IDs and context setup.
+
+Reference checkpoint: A separate set of model weights made through an
+  independent dequantization path. It provides expected values for conversion
+  checks.
+
+State dict: A mapping from model parameter names to their tensor values.
+
+Softmax: The operation that turns logits into a probability distribution over
+  the vocabulary.
+
+Token ID: An integer index into the tokenizer vocabulary. Matching token IDs
+  prevents tokenizer differences from affecting a model comparison.
+
+Top-token agreement: The percentage of positions where two models assign the
+  highest probability to the same next token.
 
 ## Compared with master
 
@@ -408,11 +446,63 @@ its displayed PPL(base) is approximate and differs from the standalone PPL.
 Use the standalone PPL runs for the direct PPL comparison; use KL and
 top-token agreement for the distribution comparison.
 
+### Transformers forward check
+
+Purpose: check that an independent Transformers implementation can load the
+dequantized text model and run a CPU forward pass.
+
+This is a manual Gemma4 integration check, not part of the 24-test unit suite.
+The reusable validation helper is tests/validate_gemma4_transformers.py. It
+builds a temporary Transformers text checkpoint and removes it when the run
+ends; it needs about 50 GB of scratch space.
+
+Using the same token IDs, BOS handling, context, and PPL calculation is a
+general cross-runtime method. The checkpoint key remapping and expert fusion
+in this helper are specific to this Gemma4 layout.
+
+Transformers could not load the original pre-quantized checkpoint. For this
+check, the helper remaps the independently dequantized reference weights to
+Gemma4TextModel state names. It moves the language-model prefix to the
+Transformers text-model prefix and concatenates each switch_glu gate/up expert
+pair into the fused gate_up_proj tensor. The Transformers model ties
+lm_head.weight to the token embedding weight.
+
+Run it with the reference checkpoint, reference GGUF, and token/log-probability
+file created by the CPU llama.cpp PPL command above:
+
+```bash
+UV_SETUP=/path/to/uv-setup.sh
+REPO_ROOT=/path/to/repo
+REFERENCE_DIR=/path/to/independent-reference
+REFERENCE_GGUF=/path/to/reference.gguf
+LOGITS_FILE=/path/to/reference-logits.bin
+UV_PYTHON=/path/to/python
+source "$UV_SETUP"
+CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=32 MKL_NUM_THREADS=32 \
+PYTHONPATH="$REPO_ROOT/gguf-py:$REPO_ROOT" "$UV_PYTHON" \
+    "$REPO_ROOT/tests/validate_gemma4_transformers.py" \
+    --reference-dir "$REFERENCE_DIR" --reference-gguf "$REFERENCE_GGUF" \
+    --logits-file "$LOGITS_FILE" --threads 32
+```
+
+The resulting text checkpoint loaded as Gemma4ForCausalLM with F32 CPU weights
+and no missing or unexpected state-dict keys. It used the same 16 chunks of
+512 saved token IDs as the llama.cpp PPL test. BOS token ID 2 was inserted at
+the start of each chunk, matching llama.cpp. The test scored the last 255
+next-token predictions in each chunk, for 4,080 scored tokens total.
+
+Transformers PPL was 15.0768. The llama.cpp reference and converted GGUFs both
+reported PPL 15.4482 +/- 0.97290 on those tokens. The difference is about 2.4
+percent and falls within the llama.cpp sample uncertainty. This is a CPU
+cross-runtime PPL comparison, not a bitwise logits comparison; the Transformers
+and llama.cpp execution paths use different numerical implementations.
+Transformers used F32 parameters while the GGUF stores mixed F16 and F32
+weights.
+
 ### Still to validate
 
-- A separate Transformers forward pass was not run. The full-model reference
-  uses independently dequantized weights, but both GGUF models use the same
-  llama.cpp CPU runtime. This isolates conversion from backend differences.
+- A direct per-token logits comparison between Transformers and llama.cpp was
+  not run. The Transformers cross-runtime check compares PPL only.
 
 - The real checkpoint validates this Gemma4 encoding. Other Gemma variants
   and other source U32 formats are not claimed to be supported by the
