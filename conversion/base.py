@@ -795,54 +795,26 @@ class ModelBase:
         return name == (key_name + suffix)
 
     def map_tensor_name(self, name: str, try_suffixes: Sequence[str] = (".weight", ".bias")) -> str:
-        if name == "model.embed_tokens.scales":
-            return "token_embd.scale"
-            
-        # match Gemma4 MoE switch expert weights/biases/scales
-        m_exp = re.match(r"model\.layers\.(\d+)\.experts\.switch_glu\.(.*?)\.(weight|bias)", name)
-        if m_exp:
-            layer_idx, subproj, suffix = m_exp.groups()
-            return f"blk.{layer_idx}.ffn_{subproj}_exps.{suffix}"
-            
-        m_scale = re.match(r"model\.layers\.(\d+)\.experts\.switch_glu\.(.*?)\.scales(\.weight)?", name)
-        if m_scale:
-            layer_idx, subproj, _ = m_scale.groups()
-            return f"blk.{layer_idx}.ffn_{subproj}_exps.weight.scale"
-
-        # match MoE router projection layers
-        m_router = re.match(r"model\.layers\.(\d+)\.router\.proj\.(weight|bias|biases|scales)", name)
-        if m_router:
-            layer_idx, suffix = m_router.groups()
-            if suffix == "biases":
-                suffix = "bias"
-            elif suffix == "scales":
-                return f"blk.{layer_idx}.ffn_gate_inp.weight.scale"
-            return f"blk.{layer_idx}.ffn_gate_inp.{suffix}"
-
-        # match self-attention projection layers (q_proj, k_proj, v_proj, o_proj)
-        m_attn = re.match(r"model\.layers\.(\d+)\.self_attn\.(q_proj|k_proj|v_proj|o_proj)\.(weight|bias|biases|scales)", name)
-        if m_attn:
-            layer_idx, proj_name, suffix = m_attn.groups()
-            if suffix == "biases":
-                suffix = "bias"
-            elif suffix == "scales":
-                return f"blk.{layer_idx}.attn_{proj_name}.weight.scale"
-            return f"blk.{layer_idx}.attn_{proj_name}.{suffix}"
-
-        # match standard MLP layers, biases, and scales
-        m_mlp = re.match(r"model\.layers\.(\d+)\.mlp\.(.*?)\.(weight|bias|biases|scales)", name)
-        if m_mlp:
-            layer_idx, subproj, suffix = m_mlp.groups()
-            if suffix == "biases":
-                suffix = "bias"
-            elif suffix == "scales":
-                return f"blk.{layer_idx}.ffn_{subproj}.weight.scale"
-            return f"blk.{layer_idx}.ffn_{subproj}.{suffix}"
-            
         new_name = self.tensor_map.get_name(key=name, try_suffixes=try_suffixes)
-        if new_name is None:
-            raise ValueError(f"Can not map tensor {name!r}")
-        return new_name  
+        if new_name is not None:
+            return new_name
+
+        if self.model_arch == gguf.MODEL_ARCH.GEMMA4:
+            m_exp = re.fullmatch(
+                r"model\.layers\.(\d+)\.experts\.switch_glu\.(gate_up_proj|gate_proj|up_proj|down_proj)\.(weight|bias)",
+                name,
+            )
+            if m_exp:
+                layer_idx, projection, suffix = m_exp.groups()
+                tensor_type = {
+                    "gate_up_proj": gguf.MODEL_TENSOR.FFN_GATE_UP_EXP,
+                    "gate_proj": gguf.MODEL_TENSOR.FFN_GATE_EXP,
+                    "up_proj": gguf.MODEL_TENSOR.FFN_UP_EXP,
+                    "down_proj": gguf.MODEL_TENSOR.FFN_DOWN_EXP,
+                }[projection]
+                return self.format_tensor_name(tensor_type, int(layer_idx), f".{suffix}")
+
+        raise ValueError(f"Can not map tensor {name!r}")
 
     def prepare_gate_up_fusion(self) -> None:
         self._unfusable_gate_up_layers.clear()

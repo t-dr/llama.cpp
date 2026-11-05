@@ -10,7 +10,7 @@ import torch
 if TYPE_CHECKING:
     from torch import Tensor
 
-from .base import MmprojModel, ModelBase, TextModel, gguf, logger
+from .base import LazyTorchTensor, MmprojModel, ModelBase, TextModel, gguf, logger
 from .qwen import DFlashModel
 
 
@@ -633,6 +633,114 @@ class Gemma3NModel(Gemma3Model):
 @ModelBase.example("google/gemma-4-31B-it", "google/gemma-4-26B-A4B-it", "google/gemma-4-E2B-it")
 class Gemma4Model(Gemma3Model):
     model_arch = gguf.MODEL_ARCH.GEMMA4
+
+    @staticmethod
+    def _dequantize_qat_weight(
+        weight: Tensor, scales: Tensor, biases: Tensor | None, bits: int, group_size: int,
+    ) -> Tensor:
+        weight = LazyTorchTensor.to_eager(weight).contiguous()
+        scales = LazyTorchTensor.to_eager(scales).contiguous()
+        if weight.dtype != torch.int32:
+            raise ValueError(f"Expected packed Gemma4 weights to use U32 storage, got {weight.dtype}")
+
+        row_shape = tuple(weight.shape[:-1])
+        n_rows = weight.numel() // weight.shape[-1]
+        if tuple(scales.shape[:-1]) != row_shape:
+            raise ValueError(f"Gemma4 weight/scales have incompatible shapes: {list(weight.shape)} and {list(scales.shape)}")
+
+        if bits == 4:
+            if group_size != 16 or scales.dtype != torch.uint8 or biases is not None:
+                raise ValueError("Gemma4 NVFP4 expects U8 scales for groups of 16")
+            weight_bytes = weight.view(torch.uint8).reshape(n_rows, -1)
+            scale_bytes = scales.view(torch.uint8).reshape(n_rows, -1)
+            if weight_bytes.shape[-1] != scale_bytes.shape[-1] * 8:
+                raise ValueError("Gemma4 NVFP4 weight and scale block counts do not match")
+            packed, _ = ModelBase._nvfp4_pack(weight_bytes, scale_bytes)
+            values = gguf.dequantize(packed, gguf.GGMLQuantizationType.NVFP4)
+            return torch.from_numpy(values.reshape(*row_shape, values.shape[-1]).copy())
+
+        if bits == 8:
+            if biases is None:
+                raise ValueError("Gemma4 INT8 weights require per-block bias tensors")
+            biases = LazyTorchTensor.to_eager(biases).contiguous()
+            if tuple(biases.shape) != tuple(scales.shape):
+                raise ValueError("Gemma4 INT8 scale and bias shapes do not match")
+            packed = weight.view(torch.uint8).numpy().reshape(n_rows, -1)
+            scale_values = scales.float().numpy().reshape(n_rows, -1)
+            bias_values = biases.float().numpy().reshape(n_rows, -1)
+            if packed.shape[-1] != scale_values.shape[-1] * group_size:
+                raise ValueError("Gemma4 INT8 weight and scale group counts do not match")
+            values = (
+                packed.astype("float32").reshape(n_rows, -1, group_size) * scale_values[:, :, None] +
+                bias_values[:, :, None]
+            ).reshape(*row_shape, -1)
+            return torch.from_numpy(values.copy())
+
+        raise ValueError(f"Unsupported Gemma4 quantization bit width: {bits}")
+
+    def _dequantize_nvfp4_checkpoint(self) -> None:
+        quant_config = self.hparams.get("quantization_config")
+        if not isinstance(quant_config, dict) or str(quant_config.get("mode", "")).lower() != "nvfp4":
+            return
+
+        if self.ftype not in (
+            gguf.LlamaFileType.ALL_F32,
+            gguf.LlamaFileType.MOSTLY_F16,
+            gguf.LlamaFileType.MOSTLY_BF16,
+        ):
+            raise NotImplementedError("Gemma4 mode=nvfp4 currently supports floating-point output types")
+
+        default_bits = int(quant_config.get("bits", 4))
+        default_group_size = int(quant_config.get("group_size", 16))
+        layer_configs = {
+            name.removeprefix("language_model."): value
+            for name, value in quant_config.items()
+            if isinstance(value, dict) and "bits" in value
+        }
+        consumed_scales: set[str] = set()
+        dequantized_count = 0
+
+        for name, weight_gen in list(self.model_tensors.items()):
+            if not name.endswith(".weight") or weight_gen().dtype != torch.int32:
+                continue
+
+            stem = name.removesuffix(".weight")
+            scale_names = [candidate for candidate in (stem + ".scales", stem + ".scales.weight")
+                           if candidate in self.model_tensors]
+            if len(scale_names) != 1:
+                raise ValueError(f"Expected one Gemma4 scale tensor for packed weight {name!r}, found {scale_names}")
+
+            scale_name = scale_names[0]
+            layer_config = layer_configs.get(stem, {})
+            bits = int(layer_config.get("bits", default_bits))
+            group_size = int(layer_config.get("group_size", default_group_size))
+            bias_name = stem + ".biases"
+            bias_gen = self.model_tensors.pop(bias_name, None)
+            if bits == 8 and bias_gen is None:
+                raise ValueError(f"Expected Gemma4 INT8 bias tensor for packed weight {name!r}")
+            if bits == 4 and bias_gen is not None:
+                raise ValueError(f"Unexpected Gemma4 bias tensor for NVFP4 weight {name!r}")
+            scales_gen = self.model_tensors.pop(scale_name)
+            self.model_tensors[name] = (
+                lambda w=weight_gen, s=scales_gen, z=bias_gen, b=bits, g=group_size:
+                    self._dequantize_qat_weight(w(), s(), None if z is None else z(), b, g)
+            )
+            consumed_scales.add(scale_name)
+            dequantized_count += 1
+
+        if dequantized_count == 0:
+            raise ValueError("Gemma4 NVFP4 checkpoint contains no packed U32 weights")
+        remaining_scales = [name for name in self.model_tensors
+                            if name.endswith((".scales", ".scales.weight")) and name not in consumed_scales]
+        if remaining_scales:
+            raise ValueError(f"Unmatched Gemma4 scale tensors: {remaining_scales[:4]}")
+        remaining_biases = [name for name in self.model_tensors if name.endswith(".biases")]
+        if remaining_biases:
+            raise ValueError(f"Unmatched Gemma4 bias tensors: {remaining_biases[:4]}")
+
+    def prepare_tensors(self):
+        self._dequantize_nvfp4_checkpoint()
+        super().prepare_tensors()
 
     def norm_shift(self, name: str) -> float:
         del name # unused

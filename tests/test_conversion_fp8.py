@@ -23,7 +23,7 @@ from conversion.deepseek import DeepseekV2Model
 from conversion.llama import LlamaModel
 from conversion.nemotron import NemotronHModel
 from conversion.phi import PhiMoeModel
-from conversion.qwen import Qwen2MoeModel, Qwen3NextModel
+from conversion.qwen import Qwen2Model, Qwen2MoeModel, Qwen3NextModel
 
 
 class ForcedF16Model(Qwen2MoeModel):
@@ -217,7 +217,43 @@ class TestFP8Conversion(unittest.TestCase):
                         dtype, data = result[target]
                         self.assertEqual(dtype, gguf.GGMLQuantizationType.F32)
                         np.testing.assert_array_equal(data, weight.float().squeeze().numpy() * (0.25 if scaled else 1.))
-                        self.assertNotIn(target.removesuffix("weight") + "scale", result)
+                    self.assertNotIn(target.removesuffix("weight") + "scale", result)
+
+    def test_compressed_packed_u32_words_keep_their_bits(self):
+        base_name = "model.layers.0.mlp.gate_proj"
+        packed = np.array([[0xF7F7F7F7]], dtype=np.uint32).view(np.int32).copy()
+        tensors = {
+            base_name + ".weight_packed": torch.from_numpy(packed),
+            base_name + ".weight_scale": torch.tensor([[2.0]]),
+            base_name + ".weight_shape": torch.tensor([1, 8], dtype=torch.int64),
+        }
+        config = {
+            "quant_method": "compressed-tensors",
+            "format": "pack-quantized",
+            "config_groups": {
+                "default": {
+                    "format": "pack-quantized",
+                    "weights": {
+                        "type": "int",
+                        "num_bits": 4,
+                        "strategy": "group",
+                        "group_size": 8,
+                    },
+                },
+            },
+        }
+
+        result = self.convert(
+            Qwen2Model,
+            tensors,
+            ftype=gguf.LlamaFileType.MOSTLY_F16,
+            hparams_override={"model_type": "qwen2", "quantization_config": config},
+        )
+
+        self.assertEqual(LazyTorchTensor._dtype_str_map["U32"], torch.int32)
+        dtype, values = result["blk.0.ffn_gate.weight"]
+        self.assertEqual(dtype, gguf.GGMLQuantizationType.F16)
+        np.testing.assert_array_equal(values.reshape(-1), [-2.0, 14.0] * 4)
 
     def test_fp8_norm_transform(self):
         for shape in ((4,), (2, 2)):
