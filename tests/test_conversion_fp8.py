@@ -221,6 +221,7 @@ class TestFP8Conversion(unittest.TestCase):
 
     def test_compressed_packed_u32_words_keep_their_bits(self):
         base_name = "model.layers.0.mlp.gate_proj"
+        # high bits in each packed byte catch accidental signed interpretation
         packed = np.array([[0xF7F7F7F7]], dtype=np.uint32).view(np.int32).copy()
         tensors = {
             base_name + ".weight_packed": torch.from_numpy(packed),

@@ -20,6 +20,7 @@ HIGH_NIBBLE = np.array([value >> 4 for value in range(256)], dtype=np.uint8)
 
 
 def ue4m3_half_scale(value: int) -> float:
+    # ignore the sign bit and apply the NVFP4 scale factor
     value &= 0x7F
     if value in (0, 0x7F):
         return 0.0
@@ -72,6 +73,7 @@ def decode_int8(
     if tuple(scales.shape[:-1]) != row_shape or packed.shape[-1] != scale_values.shape[-1] * group_size:
         raise ValueError("INT8 weight and scale shapes do not match")
 
+    # apply each block's scale and offset to unsigned byte values
     values = (
         packed.astype(np.float32).reshape(n_rows, -1, group_size) * scale_values[:, :, None]
         + bias_values[:, :, None]

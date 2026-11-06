@@ -73,6 +73,7 @@ class TestGemma4Conversion(unittest.TestCase):
     def test_nvfp4_u32_weights_dequantize_and_consume_scales(self):
         weight_name = "model.layers.0.self_attn.q_proj.weight"
         scale_name = "model.layers.0.self_attn.q_proj.scales"
+        # repeated 0x1 nibbles with this scale should decode to 0.5
         tensors = {
             weight_name: torch.full((1, 8), 0x11111111, dtype=torch.int32),
             scale_name: torch.full((1, 4), 0x38, dtype=torch.uint8),
@@ -90,6 +91,7 @@ class TestGemma4Conversion(unittest.TestCase):
         weight_name = "model.layers.0.mlp.gate_proj.weight"
         scale_name = "model.layers.0.mlp.gate_proj.scales"
         bias_name = "model.layers.0.mlp.gate_proj.biases"
+        # 0xFF bytes exercise unsigned unpacking from signed int32 storage
         words = np.full((1, 16), 0xFF0001FE, dtype=np.uint32).view(np.int32).copy()
         tensors = {
             weight_name: torch.from_numpy(words),
