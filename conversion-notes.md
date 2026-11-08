@@ -192,15 +192,48 @@ runtime loaded it and evaluated the prompt. Do not use the earlier
 intermediate output, which still contained quantization offsets as tensors.
 The original GGUF was not overwritten.
 
+### Secondary BF16 Gemma4 variant check
+
+The local `gemma-4-26B-A4B` source is `Gemma4ForConditionalGeneration` with
+30 layers, 128 experts, and top-8 routing. Its two Safetensors shards contain
+1,013 BF16 tensors. The config has no NVFP4 quantization mode, and the source
+has no packed U32 weights or `.scales`/`.biases` quantization companions. This
+checks standard BF16 Gemma4/MoE conversion, not the NVFP4/INT8 dequantizer.
+
+The converter wrote `gemma-4-26B-A4B-f16.gguf` beside the source checkpoint.
+The file is 50,505,118,272 bytes and contains 658 tensors (266 F16 and 392
+F32), including generated `rope_freqs.weight`. The dry run warned that the
+generic RoPE metadata handler does not recognize `proportional`; the
+Gemma4-specific converter emits the RoPE frequency tensor used by its
+full-attention layers. Sampled Q projection, dense MLP gate, router projection,
+and expert-0 fused gate/up values matched the source after the expected F16 or
+F32 cast. A CPU `llama-cli` load and four-token generation smoke test
+succeeded. This was not a full tensor scan, PPL test, or cross-runtime quality
+check.
+
+For the Arc test, the F16 GGUF was quantized on CPU to a separate Q4_K_M file
+beside it. The result is 16,795,998,784 bytes; the quantizer reported fallback
+quantization for 60 of 658 tensors. The CPU `llama-cli` also loaded this file
+and generated four tokens. This derivative is for GPU runtime testing; it
+does not replace the F16 conversion check.
+
+To reproduce the quantized derivative:
+
+```bash
+CPU_BUILD_DIR=/path/to/cpu-build
+INPUT_GGUF=/path/to/gemma-4-26B-A4B-f16.gguf
+OUTPUT_GGUF=/path/to/gemma-4-26B-A4B-Q4_K_M.gguf
+"$CPU_BUILD_DIR/bin/llama-quantize" "$INPUT_GGUF" "$OUTPUT_GGUF" Q4_K_M 56
+```
+
 ### CPU-only runtime checks
 
-We used a CPU-only build to isolate conversion correctness from accelerator
-selection and execution. The converted model contains about 50.5 GiB of
-tensors, while the B70 and RTX 5080 provide about 48.2 GiB of VRAM combined,
-before KV cache and runtime buffers. A GPU run would therefore place some
-weights or operations on the CPU, mixing backend behavior into this check.
-CPU execution can verify that the GGUF loads and computes, but it does not
-validate SYCL kernels or GPU performance.
+We use a CPU-only build to isolate conversion correctness from accelerator
+selection and execution. The original 31B F16 GGUF is 50,505,137,184 bytes
+(47.04 GiB), larger than either GPU individually. CUDA and SYCL memory cannot
+be combined, and CPU fallback would mix backend behavior into a GPU test.
+CPU execution verifies that a GGUF loads and computes, but does not validate
+SYCL kernels or GPU performance.
 
 The build was out of source with SYCL and the other GPU backends disabled:
 
@@ -493,17 +526,167 @@ next-token predictions in each chunk, for 4,080 scored tokens total.
 
 Transformers PPL was 15.0768. The llama.cpp reference and converted GGUFs both
 reported PPL 15.4482 +/- 0.97290 on those tokens. The difference is about 2.4
-percent and falls within the llama.cpp sample uncertainty. This is a CPU
-cross-runtime PPL comparison, not a bitwise logits comparison; the Transformers
-and llama.cpp execution paths use different numerical implementations.
-Transformers used F32 parameters while the GGUF stores mixed F16 and F32
-weights.
+percent and falls within the llama.cpp sample uncertainty. Transformers used
+F32 parameters while the GGUF stores mixed F16 and F32 weights.
+
+Because PPL does not show per-position agreement, raw logits were compared
+next on the same token IDs.
+
+A separate one-off check captured raw llama.cpp logits through the C API and
+compared them with Transformers on the same 16 chunks. It scored the same
+4,080 positions across a vocabulary of 262,144 tokens. The temporary capture
+and comparison tools were kept outside the repository; no production source
+was changed.
+
+Transformers PPL from these logits was 15.0771; llama.cpp PPL was 15.4482.
+Top-token agreement was 92.6471 percent (3,780 of 4,080 positions). Across all
+logit values, raw maximum absolute error was 16.9764 and RMS error was 0.6910.
+After subtracting each row's mean difference, centered RMS error was 0.5564.
+Mean forward and reverse KL were 0.0552 and 0.0555 nats; their 95th percentiles
+were 0.2511 and 0.2461 nats. Mean total variation was 0.1569 (95th percentile
+0.5953).
+
+The low top-token agreement prompted a weight-precision control before
+investigating model execution.
+
+To isolate weight-storage precision, a second temporary run rounded the 296
+F16-mapped Transformers tensors to F16 and back to F32, while keeping the 391
+F32-mapped tensors unchanged. This keeps Transformers computation in F32.
+Top-token agreement rose slightly to 92.9902 percent (3,794 of 4,080
+positions). Mean total variation changed to 0.1555 and centered RMS logit
+error to 0.5541. Transformers PPL was 15.0550. Weight rounding had only a
+small effect on the cross-runtime differences.
+
+Since weight rounding did not explain the gap, the next check compared layer
+activations.
+
+This is not bitwise logits parity. The result records numerical differences
+between the F32 Transformers computation and llama.cpp's mixed-precision path;
+no logit error threshold was defined. The exact tensor match plus this
+precision-matched check does not point to a conversion error.
+
+A temporary layerwise check captured scaled embeddings and all 30 layer outputs
+for one 512-token chunk. The scaled embeddings matched exactly. The first
+nonzero difference was at layer 0 (relative RMS 0.00138, cosine 0.999999);
+relative RMS grew across the stack, reaching 0.115 at layer 28 and 0.073 at
+layer 29. Error was not higher at the llama.cpp 8-token batch boundaries. This
+shows gradual cross-runtime drift, but does not identify the first differing
+operation inside layer 0.
+
+The embedding match and gradual drift led to a closer look inside layer 0.
+
+A temporary layer-0 operation check narrowed the first larger difference:
+scaled embeddings, attention normalization, Q/K/V projections and Q/K/V
+normalization had relative RMS errors below 3e-7. RoPE outputs were also close
+(Q 7.6e-6, K 6.0e-6). The first larger error was after the attention and
+output-projection path (relative RMS 0.00126). Shared MLP output error was
+0.00051. Router logits differed by 0.00103, with top-8 expert sets matching
+for 509 of 512 tokens; normalized expert output error was 0.00505. This points
+to attention computation as the first measurable divergence, with a few MoE
+routing changes that may amplify it. The exact attention operation or mask
+cause is not isolated. The layer uses a 1,024-token sliding window with a
+512-token context, and both implementations use attention scale 1.0, so the
+window cutoff and attention scale do not explain this probe's difference.
+
+Because Q/K/V projections and RoPE were already close, a flash-attention
+on/off comparison tested whether the attention kernel path caused the
+divergence.
+
+A full 16-chunk A/B check with llama.cpp flash attention disabled improved
+agreement while keeping the same GGUF, tokens, and F16-matched Transformers
+weights. The two llama.cpp attention modes had 92.5000 percent top-token
+agreement and mean total variation 0.1632. Against Transformers, non-flash
+top-token agreement was 94.9510 percent (3,874 of 4,080
+positions), mean KL in both directions fell to about 0.0322 nats, and mean
+total variation fell to 0.1105. llama.cpp PPL moved from 15.4482 to 15.1378,
+closer to the Transformers result of 15.0550. In layer 0, the attention output
+relative RMS error fell from 0.00214 to 0.00033. This implicates the default
+flash-attention path as a major source of the CPU cross-runtime difference,
+but does not establish that either implementation is incorrect.
+
+For the first 512-token chunk, a direct per-layer `kqv_out` comparison between
+the two llama.cpp modes showed the relative RMS difference growing from
+0.0021 at layer 0 to 0.081 at layer 20 and 0.080 at layer 24. This is
+consistent with accumulated attention-path drift rather than one isolated
+layer failure.
+
+An independent F64 causal-attention calculation used captured post-RoPE Q/K,
+normalized V, GQA head mapping, and scale 1.0. With the Transformers Q/K/V
+inputs, it matched the Transformers pre-projection attention output to
+1.1e-6 relative RMS. For llama.cpp, the reference rounded cached K/V to F16
+and used each attention mode's own Q/K/V inputs. It covered the sliding layer
+0 and full-attention layers 5, 11, 17, 23, and 29. Flash relative RMS errors
+were 0.0014 to 0.0060; non-flash errors were 0.00018 to 0.00060, about 8 to
+14 times closer across these layers. This confirms the flash-path difference
+across both layer types at context 512.
+
+A 1,536-token CPU check then crossed the 1,024-token sliding-window cutoff,
+using three contiguous saved token chunks with BOS only at the start. It scored
+767 positions, 511 at or beyond the cutoff. After the cutoff, non-flash had
+96.0861 percent top-token agreement with Transformers versus 92.3679 percent
+for flash; mean total variation was 0.0420 versus 0.0704. However, target-token
+PPL was 23.7139 for non-flash and 23.2363 for flash, versus 23.1370 for
+Transformers. Thus top-token/distribution metrics favored non-flash, while
+target-token PPL favored flash on this sample.
+
+Two longer CPU checks had all scored positions at or beyond the sliding-window
+cutoff. At context 2,048 (1,023 scored positions), non-flash versus flash had
+top-token agreement of 95.6989 versus 92.6686 percent with Transformers, mean
+total variation 0.03980 versus 0.06655, and PPL 10.09465 versus 10.10540
+(Transformers: 10.06076). At context 4,096
+(2,047 scored positions), non-flash versus flash had top-token agreement of
+94.4797 versus 92.0371 percent, mean total variation 0.05291 versus 0.08451,
+and PPL 4.80441 versus 4.85933 (Transformers: 4.84929). At both lengths,
+non-flash was closer on top-token agreement and distribution metrics.
+Target-token PPL favored non-flash at 2,048 but flash at 4,096. The Python and
+llama.cpp comparisons both used 32 CPU threads.
+
+Mean forward/reverse KL was 0.09782/0.04877 for flash versus
+0.04551/0.02182 for non-flash at 2,048; at 4,096 it was 0.16888/0.08423
+versus 0.06872/0.03405.
+
+A reliability repeat used four contiguous 2,048-token contexts from the same
+8,192-token stream, with BOS at each context start (4,092 scored predictions).
+Non-flash versus flash had 94.8925 versus 92.5953 percent top-token agreement,
+mean total variation 0.04619 versus 0.07485, and mean forward/reverse KL
+0.05415/0.02713 versus 0.12432/0.06303. PPL was 10.46984 for non-flash and
+10.57159 for flash, against Transformers at 10.48027. Across the four
+contexts, the mean per-context log-PPL ratio (llama.cpp/Transformers) and
+standard error were -0.00100 +/- 0.00815 for non-flash and 0.00868 +/- 0.00992
+for flash, so this sample does not establish a PPL winner.
+
+The explicit sliding-window F64 reference for layer 0 at context 1,536 gave
+relative RMS errors of 0.00593 for flash and 0.000148 for non-flash on
+positions at or beyond the cutoff. At context 4,096, layer 0 had relative RMS
+errors of 0.00577 for flash and 0.000146 for non-flash after the cutoff; full
+attention layer 5 had errors of 0.0260 and 0.000362. The lower non-flash error
+therefore persists beyond the window across sliding and full attention in the
+sampled CPU layers. End-to-end PPL remains mixed.
+
+No GPU comparison was run. The Arc Pro B70 has 32 GiB physical VRAM and
+31.89 GiB usable; the RTX 5080 has 16,303 MiB (15.92 GiB). The 50,505,137,184
+byte GGUF is 47.04 GiB, larger than either GPU individually. CUDA and SYCL
+devices cannot be combined for one inference allocation, and CPU fallback
+would invalidate a GPU-only comparison. A GPU test needs a smaller compatible
+checkpoint that fits on one backend, with device placement verified. A SYCL
+test must use `feature/sycl-topology-discovery`; its local fixes are not
+present on `conversion-update`.
 
 ### Still to validate
 
-- A direct per-token logits comparison between Transformers and llama.cpp was
-  not run. The Transformers cross-runtime check compares PPL only.
+- The CPU flash-attention A/B is closer to Transformers when flash attention is
+  disabled on top-token and distribution metrics, including the four-context
+  repeat. PPL differences vary by context and are not decisive in that repeat.
+  CPU A/B checks cover contexts 512, 1,536, 2,048, and 4,096; explicit
+  attention references cover selected layers at 512, 1,536, and 4,096. A
+  full-model GPU comparison needs a smaller compatible checkpoint on one
+  backend; do not combine CUDA and SYCL or count CPU fallback as GPU execution.
+  Any SYCL check must use `feature/sycl-topology-discovery`. Test relevant GPU
+  backends before deciding whether the flash-path difference is an expected
+  numerical limit or a correctness issue; do not change defaults based on these
+  tests alone.
 
 - The real checkpoint validates this Gemma4 encoding. Other Gemma variants
   and other source U32 formats are not claimed to be supported by the
-  Gemma4-specific NVFP4 dequantizer.
+  Gemma4-specific NVFP4 dequantizer. The BF16 26B A4B check covers standard
+  Gemma4/MoE conversion only, not NVFP4/INT8 source formats.
